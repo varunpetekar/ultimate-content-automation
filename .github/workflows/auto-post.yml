@@ -34,21 +34,6 @@ jobs:
       run: |
         mkdir -p cred
         echo "${{ secrets.CONFIG }}" > cred/.env
-        
-    - name: Download previous tracking data
-      uses: actions/download-artifact@v4
-      with:
-        name: tracking-data
-        path: ./
-      continue-on-error: true
-      
+
     - name: Run content automation
       run: python Main.py
-      
-    - name: Upload tracking file
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: tracking-data
-        path: pre_video.json
-        retention-days: 30
