@@ -8,7 +8,6 @@ import subprocess
 import time
 import warnings
 import requests
-from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional, Set
 from dotenv import load_dotenv
@@ -37,10 +36,6 @@ class ContentGenerator:
         """
         self.search_queries = search_queries
         self.video_count = video_count
-        self.output_dir = Path("temp_videos")
-        self.output_dir.mkdir(exist_ok=True)
-        self.tracking_file = Path("cred/pre_video.json")
-        self.tracking_file.parent.mkdir(exist_ok=True)
         
         # Statistics for summary
         self.stats = {
@@ -95,53 +90,7 @@ class ContentGenerator:
     def _log_substep(self, message: str, icon: str = "  ↳"):
         print(f"    {icon} {message}")
 
-        
-    def _load_downloaded_videos(self) -> Set[str]:
-        """Load set of already downloaded video URLs from JSON file."""
-        try:
-            if self.tracking_file.exists() and self.tracking_file.stat().st_size > 0:
-                with open(self.tracking_file, 'r', encoding='ascii', errors='ignore') as f:
-                    data = json.load(f)
-                    return set([video['url'] for video in data.get('downloaded_videos', [])])
-            return set()
-        except Exception as e:
-            logger.warning(f"Error loading tracking file: {e}")
-            return set()
-    
-    def _save_downloaded_video(self, url: str, title: str = "", description: str = "", channel: str = "") -> None:
-        """Save a downloaded video URL with title, description, and channel to the JSON tracking file."""
-        try:
-            # Load existing data
-            if self.tracking_file.exists() and self.tracking_file.stat().st_size > 0:
-                with open(self.tracking_file, 'r', encoding='ascii', errors='ignore') as f:
-                    data = json.load(f)
-            else:
-                data = {"downloaded_videos": []}
-            
-            # Check if video already exists
-            existing_video = None
-            for video in data['downloaded_videos']:
-                if video['url'] == url:
-                    existing_video = video
-                    break
-            
-            # Add new video if not already present
-            if not existing_video:
-                video_data = {
-                    "url": url,
-                    "title": title,
-                    "description": description,
-                    "channel": channel,
-                    "downloaded_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                }
-                data['downloaded_videos'].append(video_data)
-                
-                # Save back to file
-                with open(self.tracking_file, 'w', encoding='ascii', errors='ignore') as f:
-                    json.dump(data, f, indent=2, ensure_ascii=True)
-                    
-        except Exception as e:
-            logger.warning(f"Error saving to tracking file: {e}")
+
     
     def _upload_to_cloudinary(self, video_source, title: str) -> Optional[str]:
         """Upload video to Cloudinary (accepts file path or bytes stream) and return the URL."""
@@ -499,11 +448,10 @@ If you are the rightful owner of any content used and have any concerns, please 
                         # Construct full URLs
                         video_urls = [f"https://www.youtube.com/shorts/{vid}" for vid in unique_ids]
                         
-                        # Filter duplicates against both other found videos and historical pre_video.json
-                        downloaded_videos = self._load_downloaded_videos()
+                        # Filter duplicates against other found videos in this run
                         filtered_urls = []
                         for url in video_urls:
-                            if url not in all_video_urls and url not in downloaded_videos:
+                            if url not in all_video_urls:
                                 filtered_urls.append(url)
                                 if len(filtered_urls) >= self.video_count:
                                     break
@@ -641,8 +589,6 @@ If you are the rightful owner of any content used and have any concerns, please 
                         self.stats["instagram_uploads"] += 1
                         self._log_substep("PUBLISHED TO INSTAGRAM!", "🚀")
                         
-                        self._save_downloaded_video(url, title, description, channel)
-                        
                         # Cleanup Cloudinary
                         self._delete_from_cloudinary(f"Reels/{safe_title.replace(' ', '_').upper()}")
                     else:
@@ -718,16 +664,14 @@ If you are the rightful owner of any content used and have any concerns, please 
                 self.stats["videos_found"] += len(video_urls)
                 all_found_videos.extend(video_urls)
                 
-                downloaded_videos = self._load_downloaded_videos()
-                new_videos_for_query = [url for url in video_urls if url not in downloaded_videos]
-                new_videos_for_query = new_videos_for_query[:self.video_count]
+                new_videos_for_query = video_urls[:self.video_count]
                 
                 self.stats["videos_new"] += len(new_videos_for_query)
                 all_new_videos.extend(new_videos_for_query)
                 
-                self._log_substep(f"Found {len(video_urls)} videos ({len(new_videos_for_query)} new)")
+                self._log_substep(f"Found {len(video_urls)} videos ({len(new_videos_for_query)} to process)")
                 for i, url in enumerate(video_urls[:10], 1):
-                    status = "[NEW]" if url in new_videos_for_query else "[DONE]"
+                    status = "[QUEUE]" if url in new_videos_for_query else "[SKIP]"
                     self._log_substep(f"{i}. {url} {status}")
                 if len(video_urls) > 10:
                     self._log_substep(f"... and {len(video_urls)-10} more")
