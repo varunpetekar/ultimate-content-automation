@@ -1,0 +1,54 @@
+name: Auto Content Posting
+
+on:
+  schedule:
+    # Run every day at 9:00 AM IST (3:30 AM UTC)
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  post-content:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Create env file from secret
+      run: |
+        mkdir -p cred
+        echo "${{ secrets.CONFIG }}" > cred/.env
+        
+    - name: Download previous tracking data
+      uses: actions/download-artifact@v4
+      with:
+        name: tracking-data
+        path: ./
+      continue-on-error: true
+      
+    - name: Run content automation
+      run: python Main.py
+      
+    - name: Upload tracking file
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: tracking-data
+        path: pre_video.json
+        retention-days: 30
