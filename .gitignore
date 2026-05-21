@@ -3,3 +3,4 @@ __pycache__/
 cred/
 temp_videos/
 .env
+Backups/
