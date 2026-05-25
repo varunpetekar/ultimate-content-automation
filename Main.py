@@ -357,8 +357,9 @@ If you are the rightful owner of any content used and have any concerns, please 
         except Exception as e:
             logger.error(f"Error uploading to Instagram: {e}")
             return False
-    
-        
+    def find_video_urls(self) -> List[str]:
+        """Find video URLs from YouTube search results."""
+        all_video_urls = []
         scrapninja_key = os.getenv("SCRAPNINJA_KEY") or os.getenv("SCRAPNINJA_API_KEY") or os.getenv("RAPIDAPI_KEY")
         if scrapninja_key:
             scrapninja_key = scrapninja_key.strip('"').strip("'")
@@ -652,26 +653,22 @@ If you are the rightful owner of any content used and have any concerns, please 
         print(f"\n{'='*70}\n")
 
     def process_videos(self) -> None:
-        """Main method to find and download videos."""
-        self._log_header("STARTING CONTENT GENERATOR")
-        
         try:
             # Setup
             self._log_step("INIT", "Preparing Cloudinary environment...")
-    
-        # Determine if Cloudinary credentials are present
-        self._skip_cloudinary = not (self.cloudinary_api_key and self.cloudinary_api_secret)
-        # Setup Cloudinary only if credentials exist
-        if not self._skip_cloudinary:
-            try:
-                cloudinary.api.create_folder("Reels")
-                self._log_substep("Cloudinary 'Reels' folder ready", "✅")
-            except Exception:
-                self._log_substep("Reels folder already exists or verified", "ℹ️")
-        else:
-            self._log_substep("Cloudinary credentials missing – skipping folder setup", "⚠️")
 
-            
+            # Determine if Cloudinary credentials are present
+            self._skip_cloudinary = not (self.cloudinary_api_key and self.cloudinary_api_secret)
+            # Setup Cloudinary only if credentials exist
+            if not self._skip_cloudinary:
+                try:
+                    cloudinary.api.create_folder("Reels")
+                    self._log_substep("Cloudinary 'Reels' folder ready", "✅")
+                except Exception:
+                    self._log_substep("Reels folder already exists or verified", "ℹ️")
+            else:
+                self._log_substep("Cloudinary credentials missing – skipping folder setup", "⚠️")
+
             all_new_videos = []
             all_found_videos = []
             
