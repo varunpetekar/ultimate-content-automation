@@ -299,7 +299,7 @@ If you are the rightful owner of any content used and have any concerns, please 
                 'access_token': self.instagram_access_token
             }
             
-            container_response = requests.post(container_url, data=container_data)
+            container_response = requests.post(container_url, json=container_data)
             container_result = container_response.json()
             
             if 'id' not in container_result:
@@ -341,7 +341,7 @@ If you are the rightful owner of any content used and have any concerns, please 
                 'access_token': self.instagram_access_token
             }
             
-            publish_response = requests.post(publish_url, data=publish_data)
+            publish_response = requests.post(publish_url, json=publish_data)
             publish_result = publish_response.json()
             
             if 'id' in publish_result:
