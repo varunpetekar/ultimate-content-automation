@@ -477,6 +477,93 @@ If you are the rightful owner of any content used and have any concerns, please 
         
         return all_video_urls
     
+    def _get_video_metadata_scrapninja(self, url: str) -> tuple[str, str, str]:
+        """Fetch video metadata using ScrapNinja as a fallback when yt-dlp fails or is blocked."""
+        try:
+            import html
+            scrapninja_key = os.getenv("SCRAPNINJA_KEY") or os.getenv("SCRAPNINJA_API_KEY") or os.getenv("RAPIDAPI_KEY")
+            if scrapninja_key:
+                scrapninja_key = scrapninja_key.strip('"').strip("'")
+            else:
+                return "", "", ""
+                
+            scrapninja_url = os.getenv("SCRAPNINJA_URL") or "https://scrapeninja.p.rapidapi.com/v2/scrape-js"
+            scrapninja_url = scrapninja_url.strip('"').strip("'")
+            
+            from urllib.parse import urlparse
+            parsed_url = urlparse(scrapninja_url)
+            scrapninja_host = parsed_url.netloc or "scrapeninja.p.rapidapi.com"
+            
+            user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            ]
+            selected_ua = random.choice(user_agents)
+            
+            payload = {
+                "url": url,
+                "wait": 2000,
+                "retryNum": 2,
+                "statusNotExpected": [403, 429, 503],
+                "headers": [
+                    f"User-Agent: {selected_ua}"
+                ]
+            }
+            
+            headers = {
+                "x-rapidapi-key": scrapninja_key,
+                "x-rapidapi-host": scrapninja_host,
+                "Content-Type": "application/json"
+            }
+            
+            self._log_substep("Attempting metadata extraction via ScrapNinja rotating proxies...", "🌐")
+            response = requests.post(scrapninja_url, json=payload, headers=headers, timeout=60)
+            if response.status_code == 200:
+                response_json = response.json()
+                html_body = response_json.get("body", "")
+                
+                # Extract title
+                title = ""
+                t_match = (
+                    re.search(r'<meta\s+[^>]*property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html_body) or
+                    re.search(r'<meta\s+[^>]*content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', html_body) or
+                    re.search(r'<meta\s+[^>]*name=["\']title["\']\s+content=["\']([^"\']+)["\']', html_body) or
+                    re.search(r'<meta\s+[^>]*content=["\']([^"\']+)["\']\s+name=["\']title["\']', html_body) or
+                    re.search(r'<title>([^<]+)</title>', html_body)
+                )
+                if t_match:
+                    title = html.unescape(t_match.group(1)).replace(" - YouTube", "").strip()
+                
+                # Extract description
+                description = ""
+                d_match = (
+                    re.search(r'<meta\s+[^>]*property=["\']og:description["\']\s+content=["\']([^"\']+)["\']', html_body) or
+                    re.search(r'<meta\s+[^>]*content=["\']([^"\']+)["\']\s+property=["\']og:description["\']', html_body) or
+                    re.search(r'<meta\s+[^>]*name=["\']description["\']\s+content=["\']([^"\']+)["\']', html_body) or
+                    re.search(r'<meta\s+[^>]*content=["\']([^"\']+)["\']\s+name=["\']description["\']', html_body)
+                )
+                if d_match:
+                    description = html.unescape(d_match.group(1)).strip()
+                
+                # Extract channel/author name
+                channel = ""
+                c_match = (
+                    re.search(r'<link\s+[^>]*itemprop=["\']name["\']\s+content=["\']([^"\']+)["\']', html_body) or
+                    re.search(r'<meta\s+[^>]*itemprop=["\']name["\']\s+content=["\']([^"\']+)["\']', html_body) or
+                    re.search(r'<link\s+[^>]*content=["\']([^"\']+)["\']\s+itemprop=["\']name["\']', html_body)
+                )
+                if c_match:
+                    channel = html.unescape(c_match.group(1)).strip()
+                
+                if title or channel:
+                    return title, description, channel
+            
+            return "", "", ""
+        except Exception as e:
+            logger.warning(f"ScrapNinja metadata fallback failed: {e}")
+            return "", "", ""
+
     def _get_video_metadata(self, url: str) -> tuple[str, str, str]:
         """
         Fetch video title, description, and channel name using yt-dlp.
@@ -514,11 +601,13 @@ If you are the rightful owner of any content used and have any concerns, please 
 
             # If no valid JSON, fall back to a simpler command without extra flags.
             if result.returncode != 0:
-                logger.warning(f"yt-dlp returned error code {result.returncode} for {url}, attempting fallback.")
+                err_msg = result.stderr.strip()[:300] if result.stderr else "No stderr output"
+                logger.warning(f"yt-dlp returned error code {result.returncode} for {url}. Error info: {err_msg}")
+                logger.warning("Attempting yt-dlp fallback with iOS/Android player client...")
                 fallback_cmd = [
                     "yt-dlp",
                     "--dump-json",
-                    "--extractor-args", "youtube:player_client=android",
+                    "--extractor-args", "youtube:player_client=ios,android",
                     url
                 ]
                 fallback_res = subprocess.run(
@@ -536,8 +625,21 @@ If you are the rightful owner of any content used and have any concerns, please 
                         return title, description, channel
                     except json.JSONDecodeError:
                         logger.warning(f"Fallback JSON parse failed for {url}: {fallback_res.stdout[:200]}")
+                else:
+                    fallback_err = fallback_res.stderr.strip()[:300] if fallback_res.stderr else "No stderr output"
+                    logger.warning(f"yt-dlp fallback error: {fallback_err}")
+
+            # If both yt-dlp commands failed, try ScrapNinja as the final fallback
+            logger.warning(f"yt-dlp metadata retrieval failed for {url}. Attempting ScrapNinja fallback...")
+            title, description, channel = self._get_video_metadata_scrapninja(url)
+            if title or channel:
+                logger.info(f"Successfully retrieved metadata via ScrapNinja for {url}")
+                return title, description, channel
 
             logger.warning(f"Could not fetch metadata for {url}")
+            return "", "", ""
+        except Exception as e:
+            logger.warning(f"Error fetching metadata for {url}: {e}")
             return "", "", ""
         except Exception as e:
             logger.warning(f"Error fetching metadata for {url}: {e}")
