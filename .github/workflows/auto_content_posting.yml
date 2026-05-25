@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+        
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -23,11 +23,17 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          
+        
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+        
+      # Install ffmpeg, required by yt-dlp for metadata extraction
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
         
       - name: Write .env from CONFIG secret
         run: |
@@ -51,3 +57,7 @@ jobs:
           name: tracking-data
           path: pre_video.json
           retention-days: 30
+
+# Set UTF-8 for console output to avoid hidden Unicode issues
+env:
+  PYTHONIOENCODING: utf-8

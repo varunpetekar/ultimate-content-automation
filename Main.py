@@ -85,10 +85,13 @@ class ContentGenerator:
         print(f"{'='*70}\n")
 
     def _log_step(self, stage: str, message: str, icon: str = "*"):
-        print(f"{icon} [{stage.upper():<10}] {message}")
+        # Force ASCII icon to avoid UnicodeEncodeError on Windows consoles
+        ascii_icon = ''.join(c for c in icon if ord(c) < 128) or '*'
+        print(f"{ascii_icon} [{stage.upper():<10}] {message}")
 
-    def _log_substep(self, message: str, icon: str = "  ->"):
-        print(f"    {icon} {message}")
+    def _log_substep(self, message: str, icon: str = "->"):
+        ascii_icon = ''.join(c for c in icon if ord(c) < 128) or '->'
+        print(f"    {ascii_icon} {message}")
 
 
     
@@ -355,14 +358,6 @@ If you are the rightful owner of any content used and have any concerns, please 
             logger.error(f"Error uploading to Instagram: {e}")
             return False
     
-    def find_video_urls(self) -> List[str]:
-        """
-        Find YouTube video URLs using ScrapNinja API based on multiple search queries.
-        
-        Returns:
-            List of YouTube video URLs
-        """
-        all_video_urls = []
         
         scrapninja_key = os.getenv("SCRAPNINJA_KEY") or os.getenv("SCRAPNINJA_API_KEY") or os.getenv("RAPIDAPI_KEY")
         if scrapninja_key:
@@ -495,10 +490,6 @@ If you are the rightful owner of any content used and have any concerns, please 
             cmd = [
                 "yt-dlp",
                 "--dump-json",
-                "--no-warnings",
-                "--ignore-errors",
-                "--quiet",
-                "--extractor-args", "youtube:player_client=android",
                 url
             ]
 
@@ -667,11 +658,19 @@ If you are the rightful owner of any content used and have any concerns, please 
         try:
             # Setup
             self._log_step("INIT", "Preparing Cloudinary environment...")
+    
+        # Determine if Cloudinary credentials are present
+        self._skip_cloudinary = not (self.cloudinary_api_key and self.cloudinary_api_secret)
+        # Setup Cloudinary only if credentials exist
+        if not self._skip_cloudinary:
             try:
                 cloudinary.api.create_folder("Reels")
                 self._log_substep("Cloudinary 'Reels' folder ready", "✅")
             except Exception:
                 self._log_substep("Reels folder already exists or verified", "ℹ️")
+        else:
+            self._log_substep("Cloudinary credentials missing – skipping folder setup", "⚠️")
+
             
             all_new_videos = []
             all_found_videos = []
