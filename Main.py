@@ -84,10 +84,10 @@ class ContentGenerator:
         print(f" {title.center(68)} ")
         print(f"{'='*70}\n")
 
-    def _log_step(self, stage: str, message: str, icon: str = "🔹"):
+    def _log_step(self, stage: str, message: str, icon: str = "*"):
         print(f"{icon} [{stage.upper():<10}] {message}")
 
-    def _log_substep(self, message: str, icon: str = "  ↳"):
+    def _log_substep(self, message: str, icon: str = "  ->"):
         print(f"    {icon} {message}")
 
 
@@ -496,27 +496,57 @@ If you are the rightful owner of any content used and have any concerns, please 
                 "yt-dlp",
                 "--dump-json",
                 "--no-warnings",
+                "--ignore-errors",
+                "--quiet",
                 "--extractor-args", "youtube:player_client=android",
                 url
             ]
-            
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=60
             )
-            
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                title = data.get('title', '')
-                description = data.get('description', '')
-                channel = data.get('channel', data.get('uploader', ''))
-                return title, description, channel
-            else:
-                logger.warning(f"Could not fetch metadata for {url}")
-                return "", "", ""
-                
+
+            # If yt-dlp returned JSON in stdout even on error, parse it.
+            if result.stdout:
+                try:
+                    data = json.loads(result.stdout)
+                    title = data.get('title', '')
+                    description = data.get('description', '')
+                    channel = data.get('channel', data.get('uploader', ''))
+                    return title, description, channel
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse yt-dlp JSON for {url}: {result.stdout[:200]}")
+
+            # If no valid JSON, fall back to a simpler command without extra flags.
+            if result.returncode != 0:
+                logger.warning(f"yt-dlp returned error code {result.returncode} for {url}, attempting fallback.")
+                fallback_cmd = [
+                    "yt-dlp",
+                    "--dump-json",
+                    "--extractor-args", "youtube:player_client=android",
+                    url
+                ]
+                fallback_res = subprocess.run(
+                    fallback_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                if fallback_res.stdout:
+                    try:
+                        data = json.loads(fallback_res.stdout)
+                        title = data.get('title', '')
+                        description = data.get('description', '')
+                        channel = data.get('channel', data.get('uploader', ''))
+                        return title, description, channel
+                    except json.JSONDecodeError:
+                        logger.warning(f"Fallback JSON parse failed for {url}: {fallback_res.stdout[:200]}")
+
+            logger.warning(f"Could not fetch metadata for {url}")
+            return "", "", ""
         except Exception as e:
             logger.warning(f"Error fetching metadata for {url}: {e}")
             return "", "", ""
