@@ -2,7 +2,7 @@ name: Auto Content Posting
 
 on:
   schedule:
-    # Run every day at 9:00 AM IST (3:30 AM UTC)
+    - cron: '30 2 * * *'  # 8:00 AM IST (02:30 UTC)
     - cron: '30 3 * * *'
   workflow_dispatch:
 

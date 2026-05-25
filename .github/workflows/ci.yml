@@ -21,9 +21,9 @@ jobs:
           pip install yt-dlp
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: Create .env file from CONFIG secret
+      - name: Write .env from CONFIG secret
         run: |
           mkdir -p cred
-          echo "${{ secrets.CONFIG }}" > cred/.env
+          printf "%s" "${{ secrets.CONFIG }}" > cred/.env
       - name: Run Content Generator
         run: python Main.py

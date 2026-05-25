@@ -708,9 +708,9 @@ def main():
     try:
         # Configuration - can be moved to config file
         config = {
-            "search_queries": ["Horror Game Gameplay", "Roblox Adventure"],
-            "video_count": 2
-        }
+    "search_queries": ["game", "animation"],
+    "video_count": 2
+}
         
         generator = ContentGenerator(**config)
         generator.process_videos()
