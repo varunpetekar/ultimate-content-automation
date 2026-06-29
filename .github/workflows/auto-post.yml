@@ -31,9 +31,11 @@ jobs:
         pip install -r requirements.txt
         
     - name: Create env file from secret
+      env:
+        CONFIG: ${{ secrets.CONFIG }}
       run: |
         mkdir -p cred
-        echo "${{ secrets.CONFIG }}" > cred/.env
+        printf '%s\n' "$CONFIG" > cred/.env
 
     - name: Run content automation
       run: python Main.py

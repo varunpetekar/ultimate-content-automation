@@ -9,12 +9,16 @@ import time
 import warnings
 import requests
 from pathlib import Path
+import io
+import subprocess
 from typing import List, Optional, Set
 from dotenv import load_dotenv
 import google.generativeai as genai
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # Suppress FutureWarning for deprecated google.generativeai package
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
@@ -55,10 +59,23 @@ class ContentGenerator:
             self._log_step("SYSTEM", "Loaded environment variables from cred/.env")
         else:
             logger.warning("⚠️ cred/.env file not found")
-        
+
+        # Google Sheet tracking configuration (single source of truth)
+        self.sheet_id = os.getenv("SHEET_ID")
+        if self.sheet_id:
+            self.sheet_id = self.sheet_id.strip().strip('"').strip("'")
+        self.sheet_tab = os.getenv("SHEET_TAB", "Sheet1").strip().strip('"').strip("'")
+        self.sheet_header = ["url", "title", "description", "channel", "downloaded_at"]
+        self.sheets_service = self._init_sheets_service()
+
         # API configurations...
         self.instagram_access_token = os.getenv("INSTAGRAM_FACEBOOK_ACCESS_TOKEN")
         self.instagram_business_account_id = os.getenv("INSTAGRAM_USERID")
+        self.youtube_data_api_key = os.getenv("YOUTUBE_DATA_V3_API")
+        if self.youtube_data_api_key:
+            self.youtube_data_api_key = self.youtube_data_api_key.strip().strip('"').strip("'")
+        else:
+            logger.warning("⚠️ YOUTUBE_DATA_V3_API not found")
         self.cloudinary_base_url = "https://res.cloudinary.com/ddszy4br6/video/upload/v1776316134/Reels/"
         
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -92,6 +109,63 @@ class ContentGenerator:
 
 
     
+    def _init_sheets_service(self):
+        """Build the Google Sheets service using the service account credentials.
+
+        The Google Sheet is the single source of truth for tracking, so this
+        raises if it cannot be initialized rather than silently continuing.
+        """
+        raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if not raw or not self.sheet_id:
+            raise RuntimeError(
+                "Google Sheet tracking not configured: set GOOGLE_SERVICE_ACCOUNT_JSON and SHEET_ID in cred/.env"
+            )
+
+        info = json.loads(raw)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        self._log_step("SYSTEM", "Connected to Google Sheet for tracking")
+        return service.spreadsheets()
+
+    def _load_downloaded_videos(self) -> Set[str]:
+        """Load the set of already-uploaded video URLs from the Google Sheet.
+
+        The sheet is the only source of truth. If it cannot be read, this raises
+        so the run aborts instead of risking duplicate uploads.
+        """
+        result = self.sheets_service.values().get(
+            spreadsheetId=self.sheet_id,
+            range=f"{self.sheet_tab}!A:A",
+        ).execute()
+        rows = result.get("values", [])
+        urls = set()
+        for i, row in enumerate(rows):
+            if not row:
+                continue
+            value = row[0].strip()
+            if i == 0 and value.lower() == "url":
+                continue  # skip header row
+            if value:
+                urls.add(value)
+        return urls
+
+    def _save_downloaded_video(self, url: str, title: str = "", description: str = "", channel: str = "") -> None:
+        """Append an uploaded video as a new row in the Google Sheet."""
+        downloaded_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.sheets_service.values().append(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [[url, title, description, channel, downloaded_at]]},
+            ).execute()
+            self._log_substep("Recorded video in tracking sheet", "🧾")
+        except Exception as e:
+            logger.error(f"❌ Error writing to tracking sheet: {e}")
+
     def _upload_to_cloudinary(self, video_source, title: str) -> Optional[str]:
         """Upload video to Cloudinary (accepts file path or bytes stream) and return the URL."""
         try:
@@ -175,7 +249,6 @@ class ContentGenerator:
             
         except Exception as e:
             logger.error(f" Error during Cloudinary cleanup: {e}")
-            return False
             return False
     
     def _generate_caption_with_gemini(self, title: str, description: str, channel: str = "") -> str:
@@ -315,41 +388,57 @@ If you are the rightful owner of any content used and have any concerns, please 
                 'fields': 'status_code,status',
                 'access_token': self.instagram_access_token
             }
-            
-            max_attempts = 10
+
+            # Instagram Reels processing can take a few minutes for larger clips.
+            # Poll for up to ~5 minutes (30 attempts x 10s) before giving up.
+            max_attempts = 30
+            poll_interval = 10  # seconds between checks
+            time.sleep(5)  # give Instagram a moment to start processing
             for attempt in range(max_attempts):
                 status_response = requests.get(status_url, params=status_params)
                 status_result = status_response.json()
-                
-                logger.info(f"Media status check {attempt + 1}: {status_result}")
-                
+
+                logger.info(f"Media status check {attempt + 1}/{max_attempts}: {status_result}")
+
                 if status_result.get('status_code') == 'FINISHED':
                     break
                 elif status_result.get('status_code') == 'ERROR':
                     logger.error(f"Media processing failed: {status_result}")
                     return False
-                
-                time.sleep(5)  # Wait 5 seconds between checks
+
+                time.sleep(poll_interval)
             else:
-                logger.error("Media processing timed out")
+                logger.error(
+                    f"Media processing timed out after {max_attempts * poll_interval}s "
+                    f"(container {container_id} still IN_PROGRESS)"
+                )
                 return False
             
-            # Step 3: Publish media
+            # Step 3: Publish media (retry a few times; IG occasionally reports
+            # "media not ready" for a few seconds even after status is FINISHED)
             publish_url = f"https://graph.facebook.com/v18.0/{self.instagram_business_account_id}/media_publish"
             publish_data = {
                 'creation_id': container_id,
                 'access_token': self.instagram_access_token
             }
-            
-            publish_response = requests.post(publish_url, data=publish_data)
-            publish_result = publish_response.json()
-            
-            if 'id' in publish_result:
-                logger.info(f"Successfully uploaded to Instagram! Media ID: {publish_result['id']}")
-                return True
-            else:
-                logger.error(f"Failed to publish to Instagram: {publish_result}")
-                return False
+
+            publish_attempts = 5
+            for attempt in range(publish_attempts):
+                publish_response = requests.post(publish_url, data=publish_data)
+                publish_result = publish_response.json()
+
+                if 'id' in publish_result:
+                    logger.info(f"Successfully uploaded to Instagram! Media ID: {publish_result['id']}")
+                    return True
+
+                logger.warning(
+                    f"Publish attempt {attempt + 1}/{publish_attempts} not ready: {publish_result}"
+                )
+                if attempt < publish_attempts - 1:
+                    time.sleep(10)
+
+            logger.error(f"Failed to publish to Instagram after {publish_attempts} attempts")
+            return False
                 
         except Exception as e:
             logger.error(f"Error uploading to Instagram: {e}")
@@ -391,7 +480,8 @@ If you are the rightful owner of any content used and have any concerns, please 
         for query in self.search_queries:
             logger.info(f"🔍 Searching YouTube for: {query}")
             formatted_query = query.replace(' ', '+')
-            search_url = f'https://www.youtube.com/results?search_query={formatted_query}&sp=CAMSBAgCEAk%253D'
+            # search_url = f'https://www.youtube.com/results?search_query={formatted_query}&sp=CAMSBAgCEAk%253D'
+            search_url = f'https://www.youtube.com/results?search_query={formatted_query}&sp=EgIQCQ%253D%253D'
             
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
@@ -448,15 +538,16 @@ If you are the rightful owner of any content used and have any concerns, please 
                         # Construct full URLs
                         video_urls = [f"https://www.youtube.com/shorts/{vid}" for vid in unique_ids]
                         
-                        # Filter duplicates against other found videos in this run
+                        # Filter duplicates against other found videos in this run and already downloaded ones
+                        downloaded_videos = self._load_downloaded_videos()
                         filtered_urls = []
                         for url in video_urls:
-                            if url not in all_video_urls:
+                            if url not in all_video_urls and url not in downloaded_videos:
                                 filtered_urls.append(url)
                                 if len(filtered_urls) >= self.video_count:
                                     break
                         
-                        self._log_substep(f"Query '{query}': Found {len(filtered_urls)} videos", "✅")
+                        self._log_substep(f"Query '{query}': Found {len(filtered_urls)} new videos", "✅")
                         all_video_urls.extend(filtered_urls)
                         break  # Success - exit the retry loop
                     else:
@@ -481,42 +572,56 @@ If you are the rightful owner of any content used and have any concerns, please 
         
         return all_video_urls
     
+    def _extract_video_id(self, url: str) -> Optional[str]:
+        """Extract the 11-character YouTube video ID from a watch or shorts URL."""
+        match = re.search(r"(?:/shorts/|/watch\?v=|youtu\.be/|[?&]v=)([a-zA-Z0-9_-]{11})", url)
+        return match.group(1) if match else None
+
     def _get_video_metadata(self, url: str) -> tuple[str, str, str]:
         """
-        Fetch video title, description, and channel name using yt-dlp.
-        
+        Fetch video title, description, and channel name using the YouTube Data API v3.
+
         Args:
             url: YouTube video URL
-            
+
         Returns:
             Tuple of (title, description, channel)
         """
         try:
-            cmd = [
-                "yt-dlp",
-                "--dump-json",
-                "--no-warnings",
-                "--extractor-args", "youtube:player_client=android",
-                url
-            ]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                title = data.get('title', '')
-                description = data.get('description', '')
-                channel = data.get('channel', data.get('uploader', ''))
-                return title, description, channel
-            else:
-                logger.warning(f"Could not fetch metadata for {url}")
+            if not self.youtube_data_api_key:
+                logger.warning("YouTube Data API key not available; cannot fetch metadata")
                 return "", "", ""
-                
+
+            video_id = self._extract_video_id(url)
+            if not video_id:
+                logger.warning(f"Could not extract video ID from {url}")
+                return "", "", ""
+
+            api_url = "https://www.googleapis.com/youtube/v3/videos"
+            params = {
+                "part": "snippet",
+                "id": video_id,
+                "key": self.youtube_data_api_key
+            }
+
+            response = requests.get(api_url, params=params, timeout=30)
+            data = response.json()
+
+            if response.status_code != 200:
+                logger.warning(f"YouTube Data API error for {url}: {data}")
+                return "", "", ""
+
+            items = data.get("items", [])
+            if not items:
+                logger.warning(f"No metadata found for {url} (video may be private/deleted)")
+                return "", "", ""
+
+            snippet = items[0].get("snippet", {})
+            title = snippet.get("title", "")
+            description = snippet.get("description", "")
+            channel = snippet.get("channelTitle", "")
+            return title, description, channel
+
         except Exception as e:
             logger.warning(f"Error fetching metadata for {url}: {e}")
             return "", "", ""
@@ -588,6 +693,7 @@ If you are the rightful owner of any content used and have any concerns, please 
                     if self._upload_to_instagram(title, description, cloudinary_url, channel):
                         self.stats["instagram_uploads"] += 1
                         self._log_substep("PUBLISHED TO INSTAGRAM!", "🚀")
+                        self._save_downloaded_video(url, title, description, channel)
                         
                         # Cleanup Cloudinary
                         self._delete_from_cloudinary(f"Reels/{safe_title.replace(' ', '_').upper()}")
@@ -664,7 +770,8 @@ If you are the rightful owner of any content used and have any concerns, please 
                 self.stats["videos_found"] += len(video_urls)
                 all_found_videos.extend(video_urls)
                 
-                new_videos_for_query = video_urls[:self.video_count]
+                downloaded_videos = self._load_downloaded_videos()
+                new_videos_for_query = [url for url in video_urls if url not in downloaded_videos][:self.video_count]
                 
                 self.stats["videos_new"] += len(new_videos_for_query)
                 all_new_videos.extend(new_videos_for_query)
@@ -708,8 +815,9 @@ def main():
     try:
         # Configuration - can be moved to config file
         config = {
-            "search_queries": ["Horror Game Gameplay", "Roblox Adventure"],
-            "video_count": 2
+            # "search_queries": ["Horror Game Gameplay", "Roblox Adventure",]
+            "search_queries": ["poppy playtime animation"],
+            "video_count": 1
         }
         
         generator = ContentGenerator(**config)
@@ -723,4 +831,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()  
+    main()
