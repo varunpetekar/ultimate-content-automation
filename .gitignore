@@ -4,3 +4,4 @@ cred/
 temp_videos/
 .env
 Backups/
+Backup.py

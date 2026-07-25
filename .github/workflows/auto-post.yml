@@ -1,0 +1,46 @@
+name: Auto Content Posting
+
+on:
+  schedule:
+    # Run every day at 8:00 AM IST (2:30 AM UTC).
+    # GitHub Actions cron is always in UTC; IST is UTC+5:30.
+    - cron: '30 2 * * *'
+  workflow_dispatch:   # allows manual "Run workflow" from the Actions tab
+
+jobs:
+  post-content:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+    - name: Install ffmpeg
+      # yt-dlp uses ffmpeg to merge separate audio/video streams when needed.
+      run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Create env file from secret
+      env:
+        CONFIG: ${{ secrets.CONFIG }}
+      run: |
+        mkdir -p cred
+        printf '%s\n' "$CONFIG" > cred/.env
+
+    - name: Run content automation
+      run: python Main.py

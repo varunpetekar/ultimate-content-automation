@@ -1,22 +1,17 @@
-import io
 import json
 import logging
 import os
 import random
 import re
-import subprocess
+import tempfile
 import time
 import warnings
 import requests
 from pathlib import Path
-import io
-import subprocess
 from typing import List, Optional, Set
 from dotenv import load_dotenv
+import yt_dlp
 import google.generativeai as genai
-import cloudinary
-import cloudinary.uploader
-import cloudinary.api
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -71,13 +66,14 @@ class ContentGenerator:
         # API configurations...
         self.instagram_access_token = os.getenv("INSTAGRAM_FACEBOOK_ACCESS_TOKEN")
         self.instagram_business_account_id = os.getenv("INSTAGRAM_USERID")
+        # Graph API version used for container creation, resumable upload and publish
+        self.graph_api_version = "v23.0"
         self.youtube_data_api_key = os.getenv("YOUTUBE_DATA_V3_API")
         if self.youtube_data_api_key:
             self.youtube_data_api_key = self.youtube_data_api_key.strip().strip('"').strip("'")
         else:
             logger.warning("⚠️ YOUTUBE_DATA_V3_API not found")
-        self.cloudinary_base_url = "https://res.cloudinary.com/ddszy4br6/video/upload/v1776316134/Reels/"
-        
+
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         if self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key)
@@ -85,16 +81,6 @@ class ContentGenerator:
         else:
             logger.warning("⚠️ GEMINI_API_KEY not found")
             self.gemini_model = None
-        
-        self.cloudinary_api_key = os.getenv("CLOUDINARY_API_KEY")
-        self.cloudinary_api_secret = os.getenv("CLOUDINARY_API_SECRET")
-        self.cloudinary_cloud_name = "ddszy4br6"
-        
-        cloudinary.config(
-            cloud_name=self.cloudinary_cloud_name,
-            api_key=self.cloudinary_api_key,
-            api_secret=self.cloudinary_api_secret
-        )
 
     def _log_header(self, title: str):
         print(f"\n{'='*70}")
@@ -166,91 +152,6 @@ class ContentGenerator:
         except Exception as e:
             logger.error(f"❌ Error writing to tracking sheet: {e}")
 
-    def _upload_to_cloudinary(self, video_source, title: str) -> Optional[str]:
-        """Upload video to Cloudinary (accepts file path or bytes stream) and return the URL."""
-        try:
-            if not self.cloudinary_api_key or not self.cloudinary_api_secret:
-                logger.error("Cloudinary API credentials not found. Please set CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET in .env file")
-                return None
-            
-            # Sanitize title for Cloudinary
-            safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-            safe_title = safe_title.replace(' ', '_').upper()
-            
-            # Upload to Cloudinary using SDK (supports bytes stream or file path)
-            upload_result = cloudinary.uploader.upload(
-                video_source,
-                resource_type='video',
-                folder='Reels',
-                public_id=safe_title
-            )
-            
-            if 'secure_url' in upload_result:
-                cloudinary_url = upload_result['secure_url']
-                self._log_substep(f"Uploaded to Cloudinary: {cloudinary_url}", "✅")
-                return cloudinary_url
-            else:
-                self._log_substep(f"Cloudinary upload failed: {upload_result}", "❌")
-                return None
-                
-        except Exception as e:
-            self._log_substep(f"Error uploading to Cloudinary: {e}", "❌")
-            return None
-    
-    def _delete_from_cloudinary(self, public_id: str) -> bool:
-        """Delete video from Cloudinary to free up storage."""
-        try:
-            if not self.cloudinary_api_key or not self.cloudinary_api_secret:
-                logger.error("Cloudinary API credentials not found")
-                return False
-            
-            # Delete from Cloudinary using SDK
-            delete_result = cloudinary.uploader.destroy(
-                public_id,
-                resource_type='video'
-            )
-            
-            if delete_result.get('result') == 'ok':
-                logger.info(f"🗑️ Successfully deleted from Cloudinary: {public_id}")
-                return True
-            else:
-                logger.error(f"❌ Failed to delete from Cloudinary: {delete_result}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Error deleting from Cloudinary: {e}")
-            return False
-    
-    def _clear_all_cloudinary_videos(self) -> bool:
-        """Delete all videos and the Reels folder from Cloudinary to ensure complete cleanup."""
-        try:
-            if not self.cloudinary_api_key or not self.cloudinary_api_secret:
-                logger.error("Cloudinary API credentials not found")
-                return False
-            
-            logger.info(" invalidate: true to remove CDN cached copies")
-            folder_path = "Reels"
-            
-            # Try to delete everything inside the folder first
-            try:
-                result = cloudinary.api.delete_resources_by_prefix(folder_path + "/", invalidate=True)
-                logger.info(f" Deleted assets: {result}")
-            except Exception as assets_err:
-                logger.error(f" Bulk delete of assets failed: {assets_err}")
-            
-            # Try to delete the folder itself anyway
-            try:
-                cloudinary.api.delete_folder(folder_path)
-                logger.info(f"🗑️ Successfully deleted Cloudinary folder: {folder_path}")
-            except Exception as folder_err:
-                logger.warning(f"⚠️ Could not delete Cloudinary folder '{folder_path}': {folder_err}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f" Error during Cloudinary cleanup: {e}")
-            return False
-    
     def _generate_caption_with_gemini(self, title: str, description: str, channel: str = "") -> str:
         """Generate Instagram caption using Gemini AI with provided title, description, and channel name."""
         try:
@@ -338,16 +239,28 @@ class ContentGenerator:
             logger.error(f"Error generating caption with Gemini: {e}")
             return f"{title}\n\n{description}\n\n#gaming #roblox #videogames #trending #gamingcontent"
     
-    def _upload_to_instagram(self, title: str, description: str = "", video_url: str = "", channel: str = "") -> bool:
-        """Upload video to Instagram using Facebook Graph API."""
+    def _upload_to_instagram(self, title: str, description: str = "", video_bytes: bytes = b"", channel: str = "") -> bool:
+        """Upload a Reel to Instagram by uploading the raw video bytes directly.
+
+        Uses Meta's resumable upload flow, so no external hosting is needed:
+          1. Create a REELS container with upload_type=resumable.
+          2. POST the raw video bytes to the rupload.facebook.com host.
+          3. Poll container status, then publish.
+        """
         try:
             if not self.instagram_access_token or not self.instagram_business_account_id:
                 logger.error("Instagram API credentials not found in cred/.env file. Please ensure INSTAGRAM_FACEBOOK_ACCESS_TOKEN and INSTAGRAM_USERID are set.")
                 return False
-            
+
+            if not video_bytes:
+                logger.error("No video bytes provided for Instagram upload")
+                return False
+
+            version = self.graph_api_version
+
             # Generate caption using Gemini with title, description, and channel
             caption = self._generate_caption_with_gemini(title, description, channel)
-            
+
             # Add credit line and disclaimer
             if channel:
                 credit_line = f"\n\nCredit: {channel}"
@@ -359,31 +272,50 @@ I do not claim ownership of any clips used in this video. The content has been e
 This video follows the principles of fair use under applicable copyright laws.
 If you are the rightful owner of any content used and have any concerns, please contact me. I will promptly remove or credit the content as requested."""
                 caption = caption + credit_line + disclaimer
-            
-            logger.info(f"Attempting to upload to Instagram: {video_url}")
-            
-            # Step 1: Create media container
-            container_url = f"https://graph.facebook.com/v18.0/{self.instagram_business_account_id}/media"
-            
+
+            logger.info(f"Attempting to upload to Instagram ({len(video_bytes)} bytes): {title[:50]}")
+
+            # Step 1: Create media container with resumable upload (no hosted URL)
+            container_url = f"https://graph.facebook.com/{version}/{self.instagram_business_account_id}/media"
+
             container_data = {
                 'media_type': 'REELS',
-                'video_url': video_url,
+                'upload_type': 'resumable',
                 'caption': caption,
                 'access_token': self.instagram_access_token
             }
-            
+
             container_response = requests.post(container_url, data=container_data)
             container_result = container_response.json()
-            
+
             if 'id' not in container_result:
                 logger.error(f"Failed to create media container: {container_result}")
                 return False
-            
+
             container_id = container_result['id']
             logger.info(f"Media container created with ID: {container_id}")
-            
-            # Step 2: Check media status
-            status_url = f"https://graph.facebook.com/v18.0/{container_id}"
+
+            # Step 2: Upload the raw video bytes to the rupload host
+            rupload_url = f"https://rupload.facebook.com/ig-api-upload/{version}/{container_id}"
+            rupload_headers = {
+                'Authorization': f'OAuth {self.instagram_access_token}',
+                'offset': '0',
+                'file_size': str(len(video_bytes)),
+            }
+            logger.info("Uploading video bytes to rupload.facebook.com...")
+            rupload_response = requests.post(rupload_url, headers=rupload_headers, data=video_bytes)
+            try:
+                rupload_result = rupload_response.json()
+            except ValueError:
+                rupload_result = {"raw": rupload_response.text}
+
+            if not rupload_result.get('success') and rupload_response.status_code != 200:
+                logger.error(f"Resumable upload failed ({rupload_response.status_code}): {rupload_result}")
+                return False
+            logger.info(f"Video bytes uploaded: {rupload_result}")
+
+            # Step 3: Check media status
+            status_url = f"https://graph.facebook.com/{version}/{container_id}"
             status_params = {
                 'fields': 'status_code,status',
                 'access_token': self.instagram_access_token
@@ -416,7 +348,7 @@ If you are the rightful owner of any content used and have any concerns, please 
             
             # Step 3: Publish media (retry a few times; IG occasionally reports
             # "media not ready" for a few seconds even after status is FINISHED)
-            publish_url = f"https://graph.facebook.com/v18.0/{self.instagram_business_account_id}/media_publish"
+            publish_url = f"https://graph.facebook.com/{version}/{self.instagram_business_account_id}/media_publish"
             publish_data = {
                 'creation_id': container_id,
                 'access_token': self.instagram_access_token
@@ -446,86 +378,64 @@ If you are the rightful owner of any content used and have any concerns, please 
     
     def find_video_urls(self) -> List[str]:
         """
-        Find YouTube video URLs using ScrapNinja API based on multiple search queries.
-        
+        Find YouTube video URLs using the YouTube Data API v3 search.list endpoint.
+
+        Uses the same API key as metadata lookups (YOUTUBE_DATA_V3_API). Each
+        search.list call costs 100 quota units, so results are requested in a
+        single page per query. videoDuration=short (<4 min) narrows the pool
+        cheaply, then videos.list durations filter to <= MAX_DURATION_SECONDS.
+        URLs are built in /shorts/ form (yt-dlp handles both forms).
+
         Returns:
             List of YouTube video URLs
         """
+        MAX_DURATION_SECONDS = 50
         all_video_urls = []
-        
-        scrapninja_key = os.getenv("SCRAPNINJA_KEY") or os.getenv("SCRAPNINJA_API_KEY") or os.getenv("RAPIDAPI_KEY")
-        if scrapninja_key:
-            scrapninja_key = scrapninja_key.strip('"').strip("'")
-        else:
-            logger.error("❌ ScrapNinja API Key (SCRAPNINJA_KEY) not found in environment. Please add it to your cred/.env file.")
-            self.stats["errors"].append("ScrapNinja API key missing")
+
+        if not self.youtube_data_api_key:
+            logger.error("❌ YouTube Data API key (YOUTUBE_DATA_V3_API) not found in environment. Please add it to your cred/.env file.")
+            self.stats["errors"].append("YouTube Data API key missing")
             return []
-        
-        scrapninja_url = os.getenv("SCRAPNINJA_URL") or "https://scrapeninja.p.rapidapi.com/v2/scrape-js"
-        scrapninja_url = scrapninja_url.strip('"').strip("'")
-        
-        # Dynamically extract netloc host header from the URL
-        from urllib.parse import urlparse
-        parsed_url = urlparse(scrapninja_url)
-        scrapninja_host = parsed_url.netloc or "scrapeninja.p.rapidapi.com"
-        
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        ]
-        
+
+        search_api_url = "https://www.googleapis.com/youtube/v3/search"
+
         for query in self.search_queries:
             logger.info(f"🔍 Searching YouTube for: {query}")
-            formatted_query = query.replace(' ', '+')
-            # search_url = f'https://www.youtube.com/results?search_query={formatted_query}&sp=CAMSBAgCEAk%253D'
-            search_url = f'https://www.youtube.com/results?search_query={formatted_query}&sp=EgIQCQ%253D%253D'
-            
+
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 try:
-                    self._log_substep(f"Fetching search results via ScrapNinja (attempt {attempt}/{max_attempts})...", "🌐")
-                    
-                    selected_ua = random.choice(user_agents)
-                    payload = {
-                        "url": search_url,
-                        "wait": 3000,  # wait for JS to load
-                        "retryNum": 2,  # trigger rotating proxy retries inside ScrapNinja (max allowed is 2)
-                        "statusNotExpected": [403, 429, 503],  # status codes that trigger proxy rotation retries
-                        "headers": [
-                            f"User-Agent: {selected_ua}"
-                        ]
+                    self._log_substep(f"Fetching search results via YouTube Data API (attempt {attempt}/{max_attempts})...", "🌐")
+
+                    params = {
+                        "part": "snippet",
+                        "q": query,
+                        "type": "video",
+                        "videoDuration": "short",  # <4 min, closest proxy for Shorts
+                        # Request extra results so duplicate/already-downloaded
+                        # filtering still leaves enough new videos to process.
+                        "maxResults": min(50, max(10, self.video_count * 5)),
+                        "order": "relevance",
+                        "key": self.youtube_data_api_key,
                     }
-                    
-                    headers = {
-                        "x-rapidapi-key": scrapninja_key,
-                        "x-rapidapi-host": scrapninja_host,
-                        "Content-Type": "application/json"
-                    }
-                    
-                    # Larger timeout to allow ScrapNinja's internal retries to complete
-                    response = requests.post(scrapninja_url, json=payload, headers=headers, timeout=90)
-                    
+
+                    response = requests.get(search_api_url, params=params, timeout=30)
+                    data = response.json()
+
                     if response.status_code == 200:
-                        response_json = response.json()
-                        html = response_json.get("body", "")
-                        
-                        # Extract video IDs from both shorts and watch formats to maximize compatibility
-                        shorts_ids = re.findall(r"\/shorts\/([a-zA-Z0-9_-]{11})", html)
-                        watch_ids = re.findall(r"\/watch\?v=([a-zA-Z0-9_-]{11})", html)
-                        
-                        # Deduplicate while preserving order of appearance
+                        items = data.get("items", [])
+
+                        # Extract video IDs, deduplicating while preserving order
                         seen_ids = set()
                         unique_ids = []
-                        for video_id in shorts_ids + watch_ids:
-                            if video_id not in seen_ids:
-                                seen_ids.add(video_id)
-                                unique_ids.append(video_id)
-                        
+                        for item in items:
+                            vid = item.get("id", {}).get("videoId")
+                            if vid and vid not in seen_ids:
+                                seen_ids.add(vid)
+                                unique_ids.append(vid)
+
                         if not unique_ids:
-                            self._log_substep(f"ScrapNinja returned 200 but found 0 video IDs on attempt {attempt}", "⚠️")
+                            self._log_substep(f"YouTube Data API returned 200 but found 0 videos on attempt {attempt}", "⚠️")
                             if attempt == max_attempts:
                                 self._log_step("ERROR", f"No videos found for query '{query}' after all attempts", "❌")
                                 self.stats["errors"].append(f"Search error ({query}): no videos found")
@@ -534,10 +444,18 @@ If you are the rightful owner of any content used and have any concerns, please 
                                 self._log_substep(f"Waiting {sleep_time} seconds before reset and retry...", "⏳")
                                 time.sleep(sleep_time)
                             continue
-                        
+
+                        # Keep only videos whose actual duration is within the
+                        # limit (the API's videoDuration=short is just <4 min).
+                        durations = self._get_video_durations(unique_ids)
+                        short_ids = [vid for vid in unique_ids if 0 < durations.get(vid, 0) <= MAX_DURATION_SECONDS]
+                        dropped = len(unique_ids) - len(short_ids)
+                        if dropped:
+                            self._log_substep(f"Filtered out {dropped} videos longer than {MAX_DURATION_SECONDS}s", "✂️")
+
                         # Construct full URLs
-                        video_urls = [f"https://www.youtube.com/shorts/{vid}" for vid in unique_ids]
-                        
+                        video_urls = [f"https://www.youtube.com/shorts/{vid}" for vid in short_ids]
+
                         # Filter duplicates against other found videos in this run and already downloaded ones
                         downloaded_videos = self._load_downloaded_videos()
                         filtered_urls = []
@@ -546,20 +464,20 @@ If you are the rightful owner of any content used and have any concerns, please 
                                 filtered_urls.append(url)
                                 if len(filtered_urls) >= self.video_count:
                                     break
-                        
+
                         self._log_substep(f"Query '{query}': Found {len(filtered_urls)} new videos", "✅")
                         all_video_urls.extend(filtered_urls)
                         break  # Success - exit the retry loop
                     else:
-                        self._log_substep(f"ScrapNinja returned status code {response.status_code} on attempt {attempt}", "⚠️")
+                        self._log_substep(f"YouTube Data API returned status code {response.status_code} on attempt {attempt}: {data}", "⚠️")
                         if attempt == max_attempts:
-                            self._log_step("ERROR", f"ScrapNinja returned status code {response.status_code} after all attempts", "❌")
-                            self.stats["errors"].append(f"ScrapNinja error ({query}): status code {response.status_code}")
+                            self._log_step("ERROR", f"YouTube Data API returned status code {response.status_code} after all attempts", "❌")
+                            self.stats["errors"].append(f"YouTube Data API error ({query}): status code {response.status_code}")
                         else:
                             sleep_time = 15 if attempt == 1 else 30
                             self._log_substep(f"Waiting {sleep_time} seconds before reset and retry...", "⏳")
                             time.sleep(sleep_time)
-                            
+
                 except Exception as e:
                     self._log_substep(f"Attempt {attempt} failed: {e}", "⚠️")
                     if attempt == max_attempts:
@@ -569,9 +487,55 @@ If you are the rightful owner of any content used and have any concerns, please 
                         sleep_time = 15 if attempt == 1 else 30
                         self._log_substep(f"Waiting {sleep_time} seconds before reset and retry...", "⏳")
                         time.sleep(sleep_time)
-        
+
         return all_video_urls
-    
+
+    def _get_video_durations(self, video_ids: List[str]) -> dict:
+        """
+        Fetch durations (in seconds) for the given video IDs via videos.list.
+
+        One videos.list call costs 1 quota unit and returns up to 50 videos, so
+        a single query's results are covered by one request. Returns a dict of
+        {video_id: duration_seconds}; IDs that could not be resolved are omitted.
+        """
+        durations = {}
+        if not video_ids:
+            return durations
+
+        videos_api_url = "https://www.googleapis.com/youtube/v3/videos"
+        # videos.list accepts up to 50 IDs per call
+        for start in range(0, len(video_ids), 50):
+            batch = video_ids[start:start + 50]
+            try:
+                params = {
+                    "part": "contentDetails",
+                    "id": ",".join(batch),
+                    "key": self.youtube_data_api_key,
+                }
+                response = requests.get(videos_api_url, params=params, timeout=30)
+                data = response.json()
+                if response.status_code != 200:
+                    logger.warning(f"videos.list error while fetching durations: {data}")
+                    continue
+                for item in data.get("items", []):
+                    vid = item.get("id")
+                    iso = item.get("contentDetails", {}).get("duration", "")
+                    seconds = self._parse_iso8601_duration(iso)
+                    if vid and seconds is not None:
+                        durations[vid] = seconds
+            except Exception as e:
+                logger.warning(f"Error fetching durations: {e}")
+        return durations
+
+    @staticmethod
+    def _parse_iso8601_duration(iso: str) -> Optional[int]:
+        """Convert an ISO 8601 duration (e.g. 'PT1M5S', 'PT45S') to seconds."""
+        match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso or "")
+        if not match:
+            return None
+        hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+        return hours * 3600 + minutes * 60 + seconds
+
     def _extract_video_id(self, url: str) -> Optional[str]:
         """Extract the 11-character YouTube video ID from a watch or shorts URL."""
         match = re.search(r"(?:/shorts/|/watch\?v=|youtu\.be/|[?&]v=)([a-zA-Z0-9_-]{11})", url)
@@ -626,9 +590,75 @@ If you are the rightful owner of any content used and have any concerns, please 
             logger.warning(f"Error fetching metadata for {url}: {e}")
             return "", "", ""
     
+    def _download_video_bytes(self, url: str) -> Optional[bytes]:
+        """Download a YouTube video with the yt-dlp pip package and return its bytes.
+
+        Uses the in-process yt_dlp library (not the external binary), so the
+        version is pinned via requirements.txt and errors surface as Python
+        exceptions. yt-dlp downloads to a temp file (it can't stream cleanly to
+        memory), which is read back into bytes and then removed.
+
+        Multiple player clients are tried because YouTube increasingly blocks the
+        'android' client from datacenter IPs (e.g. GitHub Actions runners);
+        tv/web_safari/ios are more resilient. Cookie support is currently
+        disabled (commented out below) — re-enable it if YouTube starts
+        requiring "sign in to confirm you're not a bot".
+        """
+        tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
+        outtmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+
+        ydl_opts = {
+            "outtmpl": outtmpl,
+            "format": "mp4/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "force_ipv4": True,
+            "socket_timeout": 300,
+            "extractor_args": {
+                "youtube": {"player_client": ["tv", "web_safari", "ios", "android"]}
+            },
+        }
+
+        # Cookies disabled for now (running anonymously). To re-enable, drop a
+        # Netscape-format export at cred/cookies.txt and uncomment these lines:
+        # cookies_file = Path("cred/cookies.txt")
+        # if cookies_file.exists():
+        #     ydl_opts["cookiefile"] = str(cookies_file)
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                downloaded_path = ydl.prepare_filename(info)
+
+            if not os.path.exists(downloaded_path):
+                self._log_substep("Downloaded file not found on disk", "❌")
+                return None
+
+            with open(downloaded_path, "rb") as f:
+                video_bytes = f.read()
+
+            if not video_bytes:
+                self._log_substep("Downloaded file was empty (0 bytes)", "❌")
+                return None
+
+            return video_bytes
+
+        except Exception as e:
+            self._log_substep(f"yt-dlp download failed: {e}", "❌")
+            return None
+        finally:
+            # Clean up the temp file and directory regardless of outcome
+            try:
+                for name in os.listdir(tmp_dir):
+                    os.remove(os.path.join(tmp_dir, name))
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+
     def download_video(self, url: str) -> bool:
         """
-        Download a single video directly to memory using yt-dlp and upload to Cloudinary.
+        Download a single video to a temp file using the yt-dlp pip package and publish it to Instagram Reels.
         
         Args:
             url: YouTube video URL
@@ -656,56 +686,27 @@ If you are the rightful owner of any content used and have any concerns, please 
             
             self._log_substep(f"Video identified: {title[:50]}...", "📝")
             self._log_substep(f"Channel: {channel}", "📺")
-            
-            # Sanitize title for filename / Cloudinary public_id
-            safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-            
-            self._log_substep("Streaming video from YouTube into memory...", "⬇️")
-            cmd = [
-                "yt-dlp",
-                "-o", "-",
-                "-f", "mp4",
-                "--no-warnings",
-                "--extractor-args", "youtube:player_client=android",
-                url
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, timeout=300)
-            
-            if result.returncode == 0:
+
+            self._log_substep("Downloading video from YouTube...", "⬇️")
+            video_bytes = self._download_video_bytes(url)
+
+            if video_bytes:
                 self.stats["downloads_success"] += 1
                 self._log_substep("Download completed successfully", "✅")
-                
-                video_bytes = result.stdout
-                if not video_bytes:
-                    self._log_substep("Captured 0 bytes from video stream", "❌")
-                    return False
-                
-                video_stream = io.BytesIO(video_bytes)
-                
-                # Upload to Cloudinary
-                self._log_substep("Uploading stream to Cloudinary for temporary hosting...", "☁️")
-                cloudinary_url = self._upload_to_cloudinary(video_stream, title)
-                
-                if cloudinary_url:
-                    # Upload to Instagram
-                    self._log_substep("Publishing to Instagram Reels...", "📸")
-                    if self._upload_to_instagram(title, description, cloudinary_url, channel):
-                        self.stats["instagram_uploads"] += 1
-                        self._log_substep("PUBLISHED TO INSTAGRAM!", "🚀")
-                        self._save_downloaded_video(url, title, description, channel)
-                        
-                        # Cleanup Cloudinary
-                        self._delete_from_cloudinary(f"Reels/{safe_title.replace(' ', '_').upper()}")
-                    else:
-                        self._log_substep("Failed to publish to Instagram", "❌")
+
+                # Upload the raw bytes directly to Instagram Reels (resumable upload)
+                self._log_substep("Publishing to Instagram Reels...", "📸")
+                if self._upload_to_instagram(title, description, video_bytes, channel):
+                    self.stats["instagram_uploads"] += 1
+                    self._log_substep("PUBLISHED TO INSTAGRAM!", "🚀")
+                    self._save_downloaded_video(url, title, description, channel)
                 else:
-                    self._log_substep("Cloudinary upload failed", "❌")
-                
+                    self._log_substep("Failed to publish to Instagram", "❌")
+
                 return True
             else:
                 self.stats["downloads_failed"] += 1
-                self._log_substep(f"Download failed: {result.stderr.decode('utf-8', errors='ignore')[:100]}...", "❌")
+                self._log_substep("Download failed", "❌")
                 return False
                 
         except Exception as e:
@@ -741,14 +742,6 @@ If you are the rightful owner of any content used and have any concerns, please 
         self._log_header("STARTING CONTENT GENERATOR")
         
         try:
-            # Setup
-            self._log_step("INIT", "Preparing Cloudinary environment...")
-            try:
-                cloudinary.api.create_folder("Reels")
-                self._log_substep("Cloudinary 'Reels' folder ready", "✅")
-            except Exception:
-                self._log_substep("Reels folder already exists or verified", "ℹ️")
-            
             all_new_videos = []
             all_found_videos = []
             
@@ -794,13 +787,7 @@ If you are the rightful owner of any content used and have any concerns, please 
                 print(f"\n[Video {idx}/{len(all_new_videos)}]")
                 self.download_video(url)
                 time.sleep(2)
-            
-            # Cleanup Phase
-            self._log_header("CLEANUP PHASE")
-            self._log_step("CLEANUP", "Clearing temporary Cloudinary storage...", "🧹")
-            if self._clear_all_cloudinary_videos():
-                self._log_substep("Storage cleared successfully", "✅")
-            
+
             # Final Report
             self._print_summary()
             
@@ -816,7 +803,9 @@ def main():
         # Configuration - can be moved to config file
         config = {
             # "search_queries": ["Horror Game Gameplay", "Roblox Adventure",]
-            "search_queries": ["poppy playtime animation"],
+            # "search_queries": ["poppy playtime animation", "Roblox Adventure"],
+            # "video_count": 2
+            "search_queries": ["Gaming Animation"],
             "video_count": 1
         }
         
