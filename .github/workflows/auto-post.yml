@@ -1,11 +1,12 @@
 name: Auto Content Posting
 
 on:
-  schedule:
-    # Run every day at 8:00 AM IST (2:30 AM UTC).
-    # GitHub Actions cron is always in UTC; IST is UTC+5:30.
-    - cron: '30 2 * * *'
-  workflow_dispatch:   # allows manual "Run workflow" from the Actions tab
+  # Scheduled runs are PAUSED until a YouTube bot-block workaround (cookies or
+  # residential proxy) is in place. Uncomment the schedule block to resume the
+  # daily 8:00 AM IST (2:30 AM UTC) run. GitHub cron is always UTC; IST=UTC+5:30.
+  # schedule:
+  #   - cron: '30 2 * * *'
+  workflow_dispatch:   # manual "Run workflow" from the Actions tab still works
 
 jobs:
   post-content:
