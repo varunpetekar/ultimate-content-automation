@@ -1,11 +1,15 @@
+import html
 import json
 import logging
+import math
 import os
 import random
 import re
+import smtplib
 import time
 import warnings
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 import requests
 from pathlib import Path
 from typing import List, Optional, Set
@@ -141,6 +145,55 @@ PHYSICAL_CHALLENGE_PATTERN = re.compile(
 )
 
 
+class _ErrorCollector(logging.Handler):
+    """Collects ERROR-level log messages for the run summary email."""
+
+    def __init__(self, sink: List[str]):
+        super().__init__(level=logging.ERROR)
+        self.sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.sink.append(record.getMessage())
+
+
+def _redact(text: str) -> str:
+    """Mask API keys/tokens that can appear inside request URLs in error messages."""
+    return re.sub(r"(?i)\b(key|token|access_token|apikey)=[^&\s'\"]+", r"\1=***", text)
+
+
+def send_email(subject: str, text_body: str, html_body: str) -> bool:
+    """Send an email via Gmail SMTP using the app password in cred/.env.
+
+    Reads GMAIL_NOTIFIER (16-letter app password; spaces ignored), GMAIL_SENDER
+    and NOTIFY_EMAIL (defaults to the sender). Never raises: a mail failure
+    must not fail the run. Returns True if the message was handed to Gmail.
+    """
+    def env(name: str) -> str:
+        return (os.getenv(name) or "").strip().strip('"').strip("'")
+
+    password = env("GMAIL_NOTIFIER").replace(" ", "")
+    sender = env("GMAIL_SENDER")
+    recipient = env("NOTIFY_EMAIL") or sender
+    if not password or not sender:
+        print("⚠️ GMAIL_NOTIFIER / GMAIL_SENDER not set - skipping email")
+        return False
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = f"Content Generator <{sender}>"
+        msg["To"] = recipient
+        msg.set_content(text_body)
+        msg.add_alternative(html_body, subtype="html")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+            smtp.login(sender, password)
+            smtp.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"❌ Could not send email: {e}")
+        return False
+
+
 class ContentGenerator:
     """Main class for finding and downloading YouTube content."""
 
@@ -159,8 +212,20 @@ class ContentGenerator:
             "downloads_success": 0,
             "downloads_failed": 0,
             "instagram_uploads": 0,
-            "errors": []
+            "errors": [],
+            # Discovery rejections, shown in the run summary email
+            "filtered": {"too_long": 0, "region": 0, "content": 0, "already_posted": 0},
         }
+
+        # Per-video outcomes for the run summary email
+        self.run_started = time.time()
+        self.video_log: List[dict] = []
+        # {url: {"query": str, "duration": int}} recorded during discovery
+        self._video_info: dict = {}
+        # Every logger.error() message, so the summary email reports errors from any step
+        self.logged_errors: List[str] = []
+        logger.addHandler(_ErrorCollector(self.logged_errors))
+        self._email_sent = False
         
         # Load environment variables
         env_file = Path("cred/.env")
@@ -622,6 +687,7 @@ If you are the rightful owner of any content used and have any concerns, please 
                     ]
                     dropped = len(unique_ids) - len(short_ids)
                     if dropped:
+                        self.stats["filtered"]["too_long"] += dropped
                         self._log_substep(f"Filtered out {dropped} videos longer than {MAX_DURATION_SECONDS}s", "✂️")
 
                     kept_ids = []
@@ -653,10 +719,12 @@ If you are the rightful owner of any content used and have any concerns, please 
                         kept_ids.append(vid)
 
                     if region_rejected:
+                        self.stats["filtered"]["region"] += region_rejected
                         self._log_substep(
                             f"Filtered out {region_rejected} non-English/regional videos", "🌏"
                         )
                     if content_rejected:
+                        self.stats["filtered"]["content"] += content_rejected
                         self._log_substep(
                             f"Filtered out {content_rejected} facecam/challenge videos", "🙅"
                         )
@@ -668,8 +736,13 @@ If you are the rightful owner of any content used and have any concerns, please 
                         if url in all_video_urls or url in found_for_query:
                             continue
                         if url in downloaded_videos:
+                            self.stats["filtered"]["already_posted"] += 1
                             continue
                         found_for_query.append(url)
+                        self._video_info[url] = {
+                            "query": query,
+                            "duration": details[vid]["duration"],
+                        }
                         if len(found_for_query) >= self.video_count:
                             break
 
@@ -1061,6 +1134,19 @@ If you are the rightful owner of any content used and have any concerns, please 
         Returns:
             True if download and upload successful, False otherwise
         """
+        info = self._video_info.get(url, {})
+        entry = {
+            "url": url,
+            "title": url,
+            "channel": "",
+            "query": info.get("query", ""),
+            "duration": info.get("duration", 0),
+            "status": "failed",  # posted | failed | skipped
+            "note": "",
+            "downloaded": False,
+        }
+        self.video_log.append(entry)
+
         try:
             self._log_step("PROCESS", f"Starting: {url}", "🎬")
             
@@ -1068,8 +1154,10 @@ If you are the rightful owner of any content used and have any concerns, please 
             title, description, channel = self._get_video_metadata(url)
             if not title:
                 self._log_substep("Could not fetch video metadata. Skipping.", "⚠️")
+                entry["note"] = "Could not fetch video metadata"
                 return False
-            
+            entry["title"], entry["channel"] = title, channel
+
             # Skip reaction videos
             if title:
                 title_lower = title.lower()
@@ -1077,8 +1165,9 @@ If you are the rightful owner of any content used and have any concerns, please 
                 
                 if any(keyword in title_lower for keyword in reaction_keywords):
                     self._log_substep(f"Skipping reaction video: {title[:40]}...", "⏭️")
+                    entry["status"], entry["note"] = "skipped", "Reaction video"
                     return False
-            
+
             self._log_substep(f"Video identified: {title[:50]}...", "📝")
             self._log_substep(f"Channel: {channel}", "📺")
 
@@ -1087,6 +1176,7 @@ If you are the rightful owner of any content used and have any concerns, please 
 
             if video_bytes:
                 self.stats["downloads_success"] += 1
+                entry["downloaded"] = True
                 self._log_substep("Download completed successfully", "✅")
 
                 # Upload the raw bytes directly to Instagram Reels (resumable upload)
@@ -1094,22 +1184,215 @@ If you are the rightful owner of any content used and have any concerns, please 
                 if self._upload_to_instagram(title, description, video_bytes, channel):
                     self.stats["instagram_uploads"] += 1
                     self._log_substep("PUBLISHED TO INSTAGRAM!", "🚀")
+                    entry["status"] = "posted"
                     self._save_downloaded_video(url, title, description, channel)
                 else:
+                    entry["note"] = "Instagram publish failed"
                     self._log_substep("Failed to publish to Instagram", "❌")
 
                 return True
             else:
                 self.stats["downloads_failed"] += 1
+                entry["note"] = "Download failed"
                 self._log_substep("Download failed", "❌")
                 return False
                 
         except Exception as e:
             self.stats["errors"].append(f"Processing error ({url}): {e}")
+            entry["note"] = f"Processing error: {e}"
             self._log_step("ERROR", f"Processing {url}: {e}", "❌")
             return False
 
     
+    # LurkAPI price per (rounded-up) minute of video, by quality tier
+    LURKAPI_RATES = {"best": 0.020, "1080p": 0.012, "720p": 0.008, "480p": 0.006, "360p": 0.004}
+
+    def _build_run_email(self, fatal_error: Optional[str] = None) -> tuple[str, str, str]:
+        """Build the run summary email. Returns (subject, plain_text, html_body)."""
+        esc = html.escape
+        total = len(self.video_log)
+        posted = sum(1 for v in self.video_log if v["status"] == "posted")
+        failed = sum(1 for v in self.video_log if v["status"] == "failed")
+
+        # Errors from every step: tracked stats errors plus anything logged at ERROR level
+        errors = []
+        crash = [f"Run crashed: {fatal_error}"] if fatal_error else []
+        for err in crash + self.stats["errors"] + self.logged_errors:
+            err = _redact(str(err))
+            if err not in errors:
+                errors.append(err)
+
+        # Headline + colour: green = everything posted, amber = partial, red = nothing posted
+        if fatal_error:
+            icon, colour, headline = "❌", "#dc2626", "Run crashed"
+        elif total == 0 and errors:
+            icon, colour, headline = "❌", "#dc2626", "No videos found"
+        elif total == 0:
+            icon, colour, headline = "⚠️", "#d97706", "No new videos to post"
+        elif posted == 0:
+            icon, colour, headline = "❌", "#dc2626", f"0 of {total} Reels posted"
+        elif failed or errors:
+            icon, colour, headline = "⚠️", "#d97706", f"{posted} of {total} Reels posted to Instagram"
+        else:
+            icon, colour, headline = "✅", "#16a34a", f"{posted} of {total} Reels posted to Instagram"
+
+        # GitHub runners are UTC; show the time in IST
+        now = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%d %b %Y, %I:%M %p IST")
+        elapsed = int(time.time() - self.run_started)
+        took = f"{elapsed // 60} min {elapsed % 60} s"
+        trigger = {
+            "schedule": "triggered by schedule",
+            "workflow_dispatch": "manual run on GitHub",
+        }.get(os.getenv("GITHUB_EVENT_NAME", ""), "local run")
+
+        label = ("font-size:12px;font-weight:700;color:#374151;text-transform:uppercase;"
+                 "letter-spacing:.6px;padding:18px 24px 6px;")
+
+        stat_boxes = [
+            ("Queries", self.stats["queries_processed"], False),
+            ("Found", self.stats["videos_new"], False),
+            ("Downloaded", self.stats["downloads_success"], False),
+            ("Posted", posted, False),
+            ("Failed", failed, failed > 0),
+        ]
+        cells = "".join(
+            f'<td align="center" style="padding:12px 4px;background:#f4f6f8;border-radius:8px;">'
+            f'<div style="font-size:22px;font-weight:700;color:{"#dc2626" if red else "#111827"};">{value}</div>'
+            f'<div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;">{name}</div>'
+            f'</td><td width="6"></td>'
+            for name, value, red in stat_boxes
+        )
+
+        query_rows = ""
+        for query in self.search_queries:
+            q_videos = [v for v in self.video_log if v["query"] == query]
+            q_posted = sum(1 for v in q_videos if v["status"] == "posted")
+            query_rows += (
+                f'<tr><td style="padding:8px 0;border-bottom:1px solid #e5e7eb;font-size:14px;color:#111827;">{esc(query)}</td>'
+                f'<td align="right" style="padding:8px 0;border-bottom:1px solid #e5e7eb;font-size:13px;color:#6b7280;'
+                f'white-space:nowrap;">{len(q_videos)} found · <b style="color:#111827;">{q_posted} posted</b></td></tr>'
+            )
+
+        badges = {
+            "posted": ("#dcfce7", "#166534", "Posted"),
+            "failed": ("#fee2e2", "#991b1b", "Failed"),
+            "skipped": ("#e5e7eb", "#374151", "Skipped"),
+        }
+        video_rows = ""
+        for v in self.video_log:
+            bg, fg, text = badges[v["status"]]
+            meta = [esc(v["channel"])] if v["channel"] else []
+            if v["duration"]:
+                meta.append(f'{v["duration"] // 60}:{v["duration"] % 60:02d}')
+            if v["query"]:
+                meta.append(f'query: {esc(v["query"])}')
+            note = (f'<div style="font-size:12px;color:#b91c1c;margin-top:2px;">{esc(_redact(v["note"]))}</div>'
+                    if v["note"] else "")
+            video_rows += (
+                f'<tr><td style="padding:10px 0;border-bottom:1px solid #e5e7eb;">'
+                f'<a href="{esc(v["url"])}" style="color:#111827;font-weight:600;font-size:14px;text-decoration:none;">'
+                f'{esc(v["title"])}</a>'
+                f'<div style="font-size:12px;color:#6b7280;margin-top:2px;">{" · ".join(meta)}</div>{note}</td>'
+                f'<td align="right" valign="top" style="padding:10px 0 10px 8px;border-bottom:1px solid #e5e7eb;">'
+                f'<span style="background:{bg};color:{fg};font-size:11px;font-weight:700;padding:2px 8px;'
+                f'border-radius:10px;">{text}</span></td></tr>'
+            )
+        videos_section = (
+            f'<tr><td style="{label}">Videos</td></tr>'
+            f'<tr><td style="padding:0 24px;"><table width="100%" cellpadding="0" cellspacing="0">{video_rows}</table></td></tr>'
+            if video_rows else ""
+        )
+
+        filtered = self.stats["filtered"]
+        filter_rows = "".join(
+            f'<tr><td style="padding:5px 0;font-size:13px;color:#4b5563;">{name}</td>'
+            f'<td align="right" style="padding:5px 0;font-size:13px;color:#111827;font-weight:600;">{count}</td></tr>'
+            for name, count in (
+                ("Longer than 50 seconds", filtered["too_long"]),
+                ("Non-English / regional", filtered["region"]),
+                ("Facecam or physical challenge", filtered["content"]),
+                ("Already posted before", filtered["already_posted"]),
+            )
+        )
+
+        errors_section = ""
+        if errors:
+            shown = "".join(f'<div style="margin-top:4px;">• {esc(e)}</div>' for e in errors[:10])
+            more = (f'<div style="margin-top:4px;">… and {len(errors) - 10} more</div>' if len(errors) > 10 else "")
+            errors_section = (
+                f'<tr><td style="padding:18px 24px 4px;"><div style="background:#fef2f2;border-left:4px solid #dc2626;'
+                f'padding:10px 12px;font-size:13px;color:#7f1d1d;border-radius:4px;">'
+                f'<b>{len(errors)} error{"s" if len(errors) != 1 else ""}</b>{shown}{more}</div></td></tr>'
+            )
+
+        # Estimated LurkAPI cost: billed per started minute of each downloaded video
+        rate = self.LURKAPI_RATES.get(self.lurkapi_quality, 0)
+        downloaded = [v for v in self.video_log if v["downloaded"]]
+        minutes = sum(max(1, math.ceil(v["duration"] / 60)) for v in downloaded)
+        cost = minutes * rate
+
+        run_url = ""
+        if os.getenv("GITHUB_RUN_ID") and os.getenv("GITHUB_REPOSITORY"):
+            run_url = (f'{os.getenv("GITHUB_SERVER_URL", "https://github.com")}/'
+                       f'{os.getenv("GITHUB_REPOSITORY")}/actions/runs/{os.getenv("GITHUB_RUN_ID")}')
+        run_button = (
+            f'<td align="right" style="padding:12px 14px;"><a href="{esc(run_url)}" style="background:#111827;'
+            f'color:#ffffff;font-size:13px;font-weight:600;padding:9px 14px;border-radius:6px;'
+            f'text-decoration:none;">View run logs</a></td>'
+            if run_url else ""
+        )
+
+        html_body = f"""<div style="background:#eef1f4;padding:24px 12px;font-family:Segoe UI,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:auto;background:#ffffff;border-radius:12px;overflow:hidden;">
+<tr><td style="background:{colour};padding:22px 24px;color:#ffffff;">
+<div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.85;">Content Generator</div>
+<div style="font-size:22px;font-weight:700;margin-top:4px;">{esc(headline)}</div>
+<div style="font-size:13px;opacity:.9;margin-top:4px;">{now} · run took {took} · {trigger}</div></td></tr>
+<tr><td style="padding:20px 24px 4px;"><table width="100%" cellpadding="0" cellspacing="0"><tr>{cells}</tr></table></td></tr>
+<tr><td style="{label}">By search query</td></tr>
+<tr><td style="padding:0 24px;"><table width="100%" cellpadding="0" cellspacing="0">{query_rows}</table></td></tr>
+{videos_section}
+<tr><td style="{label}">Filtered out during search</td></tr>
+<tr><td style="padding:0 24px;"><table width="100%" cellpadding="0" cellspacing="0">{filter_rows}</table></td></tr>
+{errors_section}
+<tr><td style="padding:14px 24px 20px;"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f9fafb;border-radius:8px;"><tr>
+<td style="padding:12px 14px;font-size:13px;color:#4b5563;">Estimated LurkAPI cost this run<br><b style="color:#111827;font-size:15px;">${cost:.3f}</b> <span style="font-size:12px;">({len(downloaded)} videos, {minutes} billed min × ${rate:.3f} at {esc(self.lurkapi_quality)})</span></td>
+{run_button}
+</tr></table></td></tr>
+<tr><td style="padding:14px 24px;background:#f9fafb;font-size:12px;color:#9ca3af;">Sent automatically by Main.py</td></tr>
+</table></div>"""
+
+        subject = f"{icon} Content Generator: {headline}"
+        text_lines = [
+            headline,
+            f"{now} | run took {took} | {trigger}",
+            f"Queries {self.stats['queries_processed']} | Found {self.stats['videos_new']} | "
+            f"Downloaded {self.stats['downloads_success']} | Posted {posted} | Failed {failed}",
+            "",
+        ]
+        text_lines += [
+            f"[{v['status'].upper()}] {v['title']} - {v['url']}" + (f" ({_redact(v['note'])})" if v["note"] else "")
+            for v in self.video_log
+        ]
+        if errors:
+            text_lines += ["", "Errors:"] + [f"- {e}" for e in errors]
+        return subject, "\n".join(text_lines), html_body
+
+    def _send_run_email(self, fatal_error: Optional[str] = None) -> None:
+        """Email the run summary (at most once per run). Never raises."""
+        if self._email_sent:
+            return
+        try:
+            subject, text_body, html_body = self._build_run_email(fatal_error)
+        except Exception as e:
+            # Still report the run even if the detailed layout could not be built
+            subject = "❌ Content Generator: run finished, summary unavailable"
+            text_body = _redact(f"Summary could not be built: {e}\nFatal error: {fatal_error}\nStats: {self.stats}")
+            html_body = f"<pre>{html.escape(text_body)}</pre>"
+        if send_email(subject, text_body, html_body):
+            self._email_sent = True
+            self._log_step("EMAIL", "Run summary email sent", "📧")
+
     def _print_summary(self):
         """Print a clean summary of the entire run."""
         self._log_header("WORKFLOW SUMMARY")
@@ -1173,6 +1456,7 @@ If you are the rightful owner of any content used and have any concerns, please 
             
             if not all_new_videos:
                 self._log_header("NO NEW CONTENT TO PROCESS")
+                self._send_run_email()
                 return
 
             # Processing Phase
@@ -1185,15 +1469,18 @@ If you are the rightful owner of any content used and have any concerns, please 
 
             # Final Report
             self._print_summary()
+            self._send_run_email()
             
         except Exception as e:
             self._log_step("FATAL", f"Critical Error: {e}", "💥")
             self._print_summary()
+            self._send_run_email(fatal_error=str(e))
             raise
 
 
 def main():
     """Main entry point."""
+    generator = None
     try:
         # Configuration - can be moved to config file
         config = {
@@ -1204,13 +1491,28 @@ def main():
                 "horror game animation"],
             "video_count": 2
         }
-        
         generator = ContentGenerator(**config)
         generator.process_videos()
         
     except KeyboardInterrupt:
         logger.info("⏹️ Process interrupted by user")
     except Exception as e:
+        if generator is None:
+            # Startup failed (bad credentials, sheet unreachable, ...) before
+            # process_videos could send its own summary.
+            detail = _redact(f"{type(e).__name__}: {e}")
+            send_email(
+                "❌ Content Generator: failed to start",
+                f"The run failed during startup, before any video was processed.\n\n{detail}",
+                '<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:auto;">'
+                '<div style="background:#dc2626;color:#ffffff;padding:22px 24px;border-radius:12px 12px 0 0;">'
+                '<div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:.85;">Content Generator</div>'
+                '<div style="font-size:22px;font-weight:700;margin-top:4px;">Failed to start</div></div>'
+                '<div style="padding:20px 24px;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 12px 12px;'
+                'font-size:14px;color:#111827;">The run failed during startup, before any video was processed.'
+                '<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:10px 12px;margin-top:12px;'
+                f'font-size:13px;color:#7f1d1d;border-radius:4px;">{html.escape(detail)}</div></div></div>',
+            )
         logger.error(f"💥 Application Error: {e}")
         raise
 
