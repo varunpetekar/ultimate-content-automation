@@ -1199,8 +1199,10 @@ def main():
         config = {
             # "search_queries": ["Horror Game Gameplay", "Roblox Adventure",]
             "search_queries": [
-                "poppy playtime animation"],
-            "video_count": 1
+                "poppy playtime animation",
+                "Roblox Adventure",
+                "horror game animation"],
+            "video_count": 2
         }
         
         generator = ContentGenerator(**config)
