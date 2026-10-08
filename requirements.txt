@@ -1,6 +1,5 @@
 requests
 python-dotenv
 google-generativeai
-yt-dlp>=2025.1.1
 google-api-python-client
 google-auth

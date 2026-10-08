@@ -1,9 +1,7 @@
 name: Auto Content Posting
 
 on:
-  # Scheduled runs are PAUSED until a YouTube bot-block workaround (cookies or
-  # residential proxy) is in place. Uncomment the schedule block to resume the
-  # daily 8:00 AM IST (2:30 AM UTC) run. GitHub cron is always UTC; IST=UTC+5:30.
+  # Daily 8:00 AM IST (2:30 AM UTC). GitHub cron is always UTC; IST=UTC+5:30.
   schedule:
     - cron: '30 2 * * *'
   workflow_dispatch:   # manual "Run workflow" from the Actions tab still works
@@ -26,10 +24,6 @@ jobs:
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-
-    - name: Install ffmpeg
-      # yt-dlp uses ffmpeg to merge separate audio/video streams when needed.
-      run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
     - name: Install dependencies
       run: |
