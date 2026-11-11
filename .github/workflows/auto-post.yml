@@ -2,8 +2,8 @@ name: Auto Content Posting
 
 on:
   # Daily 8:00 AM IST (2:30 AM UTC). GitHub cron is always UTC; IST=UTC+5:30.
-  schedule:
-    - cron: '30 2 * * *'
+  # schedule:
+    # - cron: '30 2 * * *'
   workflow_dispatch:   # manual "Run workflow" from the Actions tab still works
 
 jobs:
