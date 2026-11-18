@@ -261,7 +261,7 @@ class ContentGenerator:
         else:
             logger.warning("⚠️ LURKAPI not found")
         self.lurkapi_endpoint = (
-            "https://api.apify.com/v2/actors/lurkapi~youtube-video-downloader/"
+            "https://api.apify.com/v2/actors/johnvc~youtube-download-api/"
             "run-sync-get-dataset-items"
         )
         # Actor is billed per minute of video by quality tier (best/1080p/720p/480p/360p)
@@ -1053,11 +1053,11 @@ If you are the rightful owner of any content used and have any concerns, please 
             return "", "", ""
     
     def _download_video_bytes(self, url: str) -> Optional[bytes]:
-        """Download a YouTube video via the LurkAPI Apify actor and return its bytes.
+        """Download a YouTube video via the youtube-download-api Apify actor and return its bytes.
 
-        The actor (lurkapi~youtube-video-downloader) is run synchronously: the
+        The actor (johnvc~youtube-download-api) is run synchronously: the
         request blocks until the run finishes and returns its dataset items.
-        Each item carries a videoFileUrl pointing at the file in Apify's
+        Each item carries a fileUrl pointing at the file in Apify's
         key-value store, which is then fetched into memory. The download itself
         happens on Apify's side, so YouTube's bot-blocking of datacenter IPs
         (e.g. GitHub Actions runners) no longer applies here.
@@ -1072,10 +1072,9 @@ If you are the rightful owner of any content used and have any concerns, please 
         payload = {
             "videoUrls": [url],
             "quality": self.lurkapi_quality,
-            "format": "mp4",
-            "includeSubtitles": False,
-            "maxVideosPerUrl": 1,
-            "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": []},
+            "format": "video",
+            # H.264 in an MP4 so Instagram Reels accepts the file
+            "videoCodec": "h264",
         }
 
         try:
@@ -1095,11 +1094,11 @@ If you are the rightful owner of any content used and have any concerns, please 
                 return None
 
             item = items[0]
-            file_url = item.get("videoFileUrl")
+            file_url = item.get("fileUrl")
             if item.get("error") or not file_url:
                 self._log_substep(
                     f"LurkAPI could not download the video: "
-                    f"{item.get('error') or item.get('status') or 'no videoFileUrl'}",
+                    f"{item.get('error') or item.get('status') or 'no fileUrl'}",
                     "❌",
                 )
                 return None
